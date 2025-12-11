@@ -275,10 +275,11 @@ class CharacterCreate(BaseModel):
     character_class: int
 
 class StageCompleteRequest(BaseModel):
-    session_token: str
     chapter: int
     stage: int
+    session_token: Optional[str] = None
     battle_log: Optional[dict] = None
+    game_log: Optional[dict] = None  # Accept both field names from client
 
 
 # ============ ENDPOINTS ============
