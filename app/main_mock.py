@@ -258,6 +258,21 @@ MOCK_CHAPTER_PROGRESS = {
 # Session tokens for battle validation
 MOCK_SESSIONS: Dict[str, Dict] = {}
 
+# Persistent inventory storage (populated on first access)
+MOCK_INVENTORIES: Dict[str, Dict] = {}
+
+# Slot ID to slot name mapping
+SLOT_ID_TO_NAME = {
+    0: "weapon", 1: "helm", 2: "armor", 3: "pants", 4: "gloves", 5: "boots",
+    6: "ring1", 7: "ring2", 8: "bracelet1", 9: "bracelet2", 10: "necklace", 11: "wings"
+}
+
+# Item types
+ITEM_TYPE_GEAR = 0
+ITEM_TYPE_CONSUMABLE = 1
+ITEM_TYPE_UPGRADE_GEM = 3
+ITEM_TYPE_REFINE_GEM = 4
+
 
 # ============ SCHEMAS ============
 
@@ -280,6 +295,30 @@ class StageCompleteRequest(BaseModel):
     session_token: Optional[str] = None
     battle_log: Optional[dict] = None
     game_log: Optional[dict] = None  # Accept both field names from client
+
+
+class InventoryAction(BaseModel):
+    action: str  # equip, unequip, discard, lock, unlock, equip_potion
+    item_id: Optional[str] = None
+    slot_id: Optional[int] = None
+    potion_type: Optional[str] = None  # "health" or "mana"
+    timestamp: Optional[int] = None
+
+
+class InventoryActionsRequest(BaseModel):
+    actions: List[InventoryAction]
+
+
+class ActionResult(BaseModel):
+    success: bool
+    error: Optional[str] = None
+
+
+class InventoryActionsResponse(BaseModel):
+    success: bool
+    results: List[ActionResult]
+    failed_index: int
+    inventory: dict
 
 
 # ============ ENDPOINTS ============
@@ -421,8 +460,8 @@ async def get_inventory(character_id: str, authorization: Optional[str] = Header
     if character_id not in MOCK_USER_CHARACTERS[token]:
         raise HTTPException(status_code=403, detail="Character not found or not owned by user")
     
-    # Return mock inventory with sample items
-    inventory = _generate_mock_inventory(character_id)
+    # Return persistent inventory (creates from mock if needed)
+    inventory = _get_or_create_inventory(character_id)
     
     return {
         "success": True,
@@ -441,9 +480,62 @@ async def save_inventory(character_id: str, data: dict, authorization: Optional[
     if character_id not in MOCK_USER_CHARACTERS[token]:
         raise HTTPException(status_code=403, detail="Character not found or not owned by user")
     
+    # Store in persistent mock storage
+    MOCK_INVENTORIES[character_id] = data
+    
     return {
         "success": True,
         "inventory": data
+    }
+
+
+@app.post("/character/{character_id}/inventory/actions")
+async def execute_inventory_actions(
+    character_id: str, 
+    data: InventoryActionsRequest, 
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Execute batched inventory actions (equip, unequip, discard, lock, unlock, equip_potion).
+    Actions are processed in order. Stops on first failure.
+    """
+    token = verify_token(authorization)
+    
+    if token not in MOCK_USER_CHARACTERS:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    
+    if character_id not in MOCK_USER_CHARACTERS[token]:
+        raise HTTPException(status_code=403, detail="Character not found or not owned by user")
+    
+    # Get or initialize persistent inventory
+    inventory = _get_or_create_inventory(character_id)
+    
+    results: List[ActionResult] = []
+    failed_index = -1
+    
+    # Process each action in order
+    for i, action in enumerate(data.actions):
+        result = _validate_and_apply_action(inventory, action, character_id)
+        results.append(result)
+        
+        if not result.success:
+            failed_index = i
+            # Return immediately on failure
+            return {
+                "success": False,
+                "results": [{"success": r.success, "error": r.error} for r in results],
+                "failed_index": failed_index,
+                "inventory": inventory
+            }
+    
+    # All actions succeeded - persist the inventory
+    MOCK_INVENTORIES[character_id] = inventory
+    
+    return {
+        "success": True,
+        "results": [{"success": r.success, "error": r.error} for r in results],
+        "failed_index": -1,
+        "inventory": inventory
     }
 
 
@@ -915,6 +1007,226 @@ def _create_gear_item(item_id: str, name: str, slot: int, required_class: int, r
         "bonus_stats": [],
         "upgrade_level": upgrade_level
     }
+
+
+# ============ INVENTORY ACTION HELPERS ============
+
+def _get_or_create_inventory(character_id: str) -> dict:
+    """Get persistent inventory or create from mock data"""
+    if character_id not in MOCK_INVENTORIES:
+        MOCK_INVENTORIES[character_id] = _generate_mock_inventory(character_id)
+    return MOCK_INVENTORIES[character_id]
+
+
+def _find_item_in_inventory(inventory: dict, item_id: str) -> Optional[dict]:
+    """Find an item in the inventory items list by ID"""
+    for item in inventory.get("items", []):
+        if item.get("id") == item_id:
+            return item
+    return None
+
+
+def _find_item_in_equipped(inventory: dict, item_id: str) -> Optional[tuple]:
+    """Find an item in equipped slots. Returns (slot_name, item) or None"""
+    equipped = inventory.get("equipped_items", {})
+    for slot_name, item in equipped.items():
+        if item and item.get("id") == item_id:
+            return (slot_name, item)
+    return None
+
+
+def _remove_item_from_inventory(inventory: dict, item_id: str) -> Optional[dict]:
+    """Remove an item from inventory items list. Returns the removed item or None"""
+    items = inventory.get("items", [])
+    for i, item in enumerate(items):
+        if item.get("id") == item_id:
+            return items.pop(i)
+    return None
+
+
+def _validate_and_apply_action(inventory: dict, action: InventoryAction, character_id: str) -> ActionResult:
+    """Validate and apply a single inventory action"""
+    action_type = action.action.lower()
+    
+    if action_type == "equip":
+        return _action_equip(inventory, action, character_id)
+    elif action_type == "unequip":
+        return _action_unequip(inventory, action)
+    elif action_type == "discard":
+        return _action_discard(inventory, action)
+    elif action_type == "lock":
+        return _action_lock(inventory, action, True)
+    elif action_type == "unlock":
+        return _action_lock(inventory, action, False)
+    elif action_type == "equip_potion":
+        return _action_equip_potion(inventory, action, character_id)
+    else:
+        return ActionResult(success=False, error=f"Unknown action type: {action_type}")
+
+
+def _action_equip(inventory: dict, action: InventoryAction, character_id: str) -> ActionResult:
+    """Equip an item from inventory to an equipment slot"""
+    # Validate required fields
+    if not action.item_id:
+        return ActionResult(success=False, error="item_id is required for equip action")
+    if action.slot_id is None:
+        return ActionResult(success=False, error="slot_id is required for equip action")
+    
+    # Validate slot_id range
+    if action.slot_id not in SLOT_ID_TO_NAME:
+        return ActionResult(success=False, error=f"Invalid slot_id: {action.slot_id}")
+    
+    # Find item in inventory
+    item = _find_item_in_inventory(inventory, action.item_id)
+    if not item:
+        return ActionResult(success=False, error="Item not found in inventory")
+    
+    # Validate item is gear type (not potion/gem)
+    item_type = item.get("item_type", -1)
+    if item_type != ITEM_TYPE_GEAR:
+        return ActionResult(success=False, error="Item is not equippable gear")
+    
+    # Validate item's slot matches requested slot_id
+    item_slot = item.get("slot", -1)
+    # Handle rings and bracelets which can go in either slot
+    valid_slots = [action.slot_id]
+    if action.slot_id in [6, 7]:  # ring1, ring2
+        valid_slots = [6, 7]
+    elif action.slot_id in [8, 9]:  # bracelet1, bracelet2
+        valid_slots = [8, 9]
+    
+    if item_slot not in valid_slots:
+        return ActionResult(success=False, error=f"Item slot ({item_slot}) does not match requested slot ({action.slot_id})")
+    
+    slot_name = SLOT_ID_TO_NAME[action.slot_id]
+    equipped_items = inventory.setdefault("equipped_items", {})
+    
+    # If slot is occupied, move current item to inventory
+    current_equipped = equipped_items.get(slot_name)
+    if current_equipped and current_equipped.get("id"):
+        inventory["items"].append(current_equipped)
+    
+    # Remove item from inventory and equip it
+    _remove_item_from_inventory(inventory, action.item_id)
+    equipped_items[slot_name] = item
+    
+    return ActionResult(success=True)
+
+
+def _action_unequip(inventory: dict, action: InventoryAction) -> ActionResult:
+    """Unequip an item from equipment slot to inventory"""
+    # Validate required fields
+    if action.slot_id is None:
+        return ActionResult(success=False, error="slot_id is required for unequip action")
+    
+    # Validate slot_id range
+    if action.slot_id not in SLOT_ID_TO_NAME:
+        return ActionResult(success=False, error=f"Invalid slot_id: {action.slot_id}")
+    
+    slot_name = SLOT_ID_TO_NAME[action.slot_id]
+    equipped_items = inventory.get("equipped_items", {})
+    
+    # Check if slot has an item
+    current_item = equipped_items.get(slot_name)
+    if not current_item or not current_item.get("id"):
+        return ActionResult(success=False, error=f"No item equipped in slot {slot_name}")
+    
+    # Check inventory capacity
+    items = inventory.get("items", [])
+    capacity = inventory.get("capacity", 50)
+    if len(items) >= capacity:
+        return ActionResult(success=False, error="Inventory is full")
+    
+    # Move item to inventory
+    inventory["items"].append(current_item)
+    equipped_items[slot_name] = {}
+    
+    return ActionResult(success=True)
+
+
+def _action_discard(inventory: dict, action: InventoryAction) -> ActionResult:
+    """Discard an item from inventory permanently"""
+    # Validate required fields
+    if not action.item_id:
+        return ActionResult(success=False, error="item_id is required for discard action")
+    
+    # Find item in inventory
+    item = _find_item_in_inventory(inventory, action.item_id)
+    if not item:
+        return ActionResult(success=False, error="Item not found in inventory")
+    
+    # Check if item is locked
+    if item.get("locked", False):
+        return ActionResult(success=False, error="Cannot discard locked item")
+    
+    # Remove item
+    _remove_item_from_inventory(inventory, action.item_id)
+    
+    return ActionResult(success=True)
+
+
+def _action_lock(inventory: dict, action: InventoryAction, lock_value: bool) -> ActionResult:
+    """Lock or unlock an item (in inventory or equipped)"""
+    # Validate required fields
+    if not action.item_id:
+        return ActionResult(success=False, error=f"item_id is required for {'lock' if lock_value else 'unlock'} action")
+    
+    # Try to find in inventory first
+    item = _find_item_in_inventory(inventory, action.item_id)
+    if item:
+        item["locked"] = lock_value
+        return ActionResult(success=True)
+    
+    # Try to find in equipped items
+    equipped_result = _find_item_in_equipped(inventory, action.item_id)
+    if equipped_result:
+        slot_name, item = equipped_result
+        item["locked"] = lock_value
+        return ActionResult(success=True)
+    
+    return ActionResult(success=False, error="Item not found")
+
+
+def _action_equip_potion(inventory: dict, action: InventoryAction, character_id: str) -> ActionResult:
+    """Equip a potion to health or mana slot"""
+    # Validate required fields
+    if not action.item_id:
+        return ActionResult(success=False, error="item_id is required for equip_potion action")
+    if not action.potion_type:
+        return ActionResult(success=False, error="potion_type is required for equip_potion action")
+    if action.potion_type not in ["health", "mana"]:
+        return ActionResult(success=False, error="potion_type must be 'health' or 'mana'")
+    
+    # Find item in inventory
+    item = _find_item_in_inventory(inventory, action.item_id)
+    if not item:
+        return ActionResult(success=False, error="Item not found in inventory")
+    
+    # Validate item is consumable type
+    item_type = item.get("item_type", -1)
+    if item_type != ITEM_TYPE_CONSUMABLE:
+        return ActionResult(success=False, error="Item is not a consumable")
+    
+    # Update potions in inventory
+    potions = inventory.setdefault("potions", {
+        "health_potion": None,
+        "mana_potion": None,
+        "health_slot_id": "",
+        "mana_slot_id": ""
+    })
+    
+    if action.potion_type == "health":
+        potions["health_potion"] = item
+        potions["health_slot_id"] = action.item_id
+    else:
+        potions["mana_potion"] = item
+        potions["mana_slot_id"] = action.item_id
+    
+    # Also update character data if available
+    if character_id in MOCK_CHARACTERS:
+        MOCK_CHARACTERS[character_id]["potions"] = potions
+    
+    return ActionResult(success=True)
 
 
 if __name__ == "__main__":
